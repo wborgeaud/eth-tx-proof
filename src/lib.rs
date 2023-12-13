@@ -266,7 +266,7 @@ async fn prove_tx(
         .take(tx_index + 1)
     {
         log::info!("Processing {}-th transaction: {:?}", i, tx.hash);
-        let last_tx = tx_index == block.transactions.len() - 1;
+        let last_tx = i == block.transactions.len() - 1;
         let trace = provider
             .debug_trace_transaction(tx.hash, tracing_options_diff())
             .await?;
