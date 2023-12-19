@@ -1,29 +1,25 @@
 #![allow(clippy::needless_range_loop)]
 
+pub mod cli;
 pub mod mpt;
 pub mod utils;
 
-use itertools::izip;
 use std::collections::{BTreeMap, HashMap};
-use std::time::Duration;
 
-use crate::mpt::{apply_diffs, insert_mpt, trim, Mpt};
-use crate::utils::{has_storage_deletion, keccak};
 use anyhow::{anyhow, Result};
 use eth_trie_utils::nibbles::Nibbles;
 use eth_trie_utils::partial_trie::{HashedPartialTrie, Node, PartialTrie};
 use ethers::prelude::*;
 use ethers::types::GethDebugTracerType;
 use ethers::utils::rlp;
-use plonky2::field::goldilocks_field::GoldilocksField;
-use plonky2::plonk::config::KeccakGoldilocksConfig;
-use plonky2::util::timing::TimingTree;
-use plonky2_evm::all_stark::AllStark;
-use plonky2_evm::config::StarkConfig;
-use plonky2_evm::generation::{generate_traces, GenerationInputs, TrieInputs};
+use itertools::izip;
+use plonky2_evm::generation::{GenerationInputs, TrieInputs};
 use plonky2_evm::proof::BlockMetadata;
 use plonky2_evm::proof::{BlockHashes, TrieRoots};
-use plonky2_evm::prover::prove;
+use protocol_decoder::types::TxnProofGenIR;
+
+use crate::mpt::{apply_diffs, insert_mpt, trim, Mpt};
+use crate::utils::{has_storage_deletion, keccak};
 
 /// Keccak of empty bytes.
 pub const EMPTY_HASH: H256 = H256([
@@ -38,7 +34,7 @@ pub async fn get_proof(
     block_number: U64,
     provider: &Provider<Http>,
 ) -> Result<(Vec<Bytes>, Vec<StorageProof>, H256, bool)> {
-    // log::info!("Proof {:?}: {:?} {:?}", block_number, address, locations);
+    // tracing::info!("Proof {:?}: {:?} {:?}", block_number, address, locations);
     // println!("Proof {:?}: {:?} {:?}", block_number, address, locations);
     let proof = provider.get_proof(address, locations, Some(block_number.into()));
     let proof = proof.await?;
@@ -55,7 +51,9 @@ pub async fn get_proof(
 /// Tracing options for the debug_traceTransaction call.
 fn tracing_options() -> GethDebugTracingOptions {
     GethDebugTracingOptions {
-        tracer: Some(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::PreStateTracer)),
+        tracer: Some(GethDebugTracerType::BuiltInTracer(
+            GethDebugBuiltInTracerType::PreStateTracer,
+        )),
 
         ..GethDebugTracingOptions::default()
     }
@@ -63,7 +61,9 @@ fn tracing_options() -> GethDebugTracingOptions {
 
 fn tracing_options_diff() -> GethDebugTracingOptions {
     GethDebugTracingOptions {
-        tracer: Some(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::PreStateTracer)),
+        tracer: Some(GethDebugTracerType::BuiltInTracer(
+            GethDebugBuiltInTracerType::PreStateTracer,
+        )),
 
         tracer_config: Some(GethDebugTracerConfig::BuiltInTracer(
             GethDebugBuiltInTracerConfig::PreStateTracer(PreStateConfig {
@@ -117,7 +117,11 @@ pub async fn get_block_metadata(
     ))
 }
 
-pub async fn gather_witness_and_prove_tx(tx: Transaction, provider: &Provider<Http>) -> Result<()> {
+pub async fn gather_witness(tx: TxHash, provider: &Provider<Http>) -> Result<Vec<TxnProofGenIR>> {
+    let tx = provider
+        .get_transaction(tx)
+        .await?
+        .ok_or_else(|| anyhow!("Transaction not found."))?;
     let block_number = tx.block_number.unwrap().0[0];
     let tx_index = tx.transaction_index.unwrap().0[0] as usize;
     let block = provider
@@ -138,13 +142,14 @@ pub async fn gather_witness_and_prove_tx(tx: Transaction, provider: &Provider<Ht
         let txn = txn
             .await?
             .ok_or_else(|| anyhow!("Transaction not found."))?;
-        // chain_id = txn.chain_id.unwrap(); // TODO: For type-0 txn, the chain_id is not set so the unwrap panics.
+        // chain_id = txn.chain_id.unwrap(); // TODO: For type-0 txn, the chain_id is
+        // not set so the unwrap panics.
         let trace = provider
             .debug_trace_transaction(hash, tracing_options())
             .await?;
-        let accounts = if let GethTrace::Known(
-            GethTraceFrame::PreStateTracer(PreStateFrame::Default(accounts))
-        ) = trace
+        let accounts = if let GethTrace::Known(GethTraceFrame::PreStateTracer(
+            PreStateFrame::Default(accounts),
+        )) = trace
         {
             accounts.0
         } else {
@@ -287,55 +292,32 @@ pub async fn gather_witness_and_prove_tx(tx: Transaction, provider: &Provider<Ht
     let (block_metadata, _final_hash) =
         get_block_metadata(block_number.into(), chain_id, provider).await?;
 
-    prove_tx(
-        tx_index,
-        txn_rlps,
-        block_metadata,
-        state_mpt,
-        contract_codes,
-        storage_mpts
-            .iter()
-            .map(|(a, m)| (*a, m.to_partial_trie()))
-            .collect(),
-        txns_info,
-        traces,
-        block,
-        provider,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn prove_tx(
-    tx_index: usize,
-    signed_txns: Vec<Vec<u8>>,
-    block_metadata: BlockMetadata,
-    state_mpt: Mpt,
-    mut contract_code: HashMap<H256, Vec<u8>>,
-    mut storage_mpts: HashMap<H256, HashedPartialTrie>,
-    txns_info: Vec<Transaction>,
-    traces: Vec<BTreeMap<Address, AccountState>>,
-    block: Block<H256>,
-    provider: &Provider<Http>,
-) -> Result<()> {
     let mut state_mpt = state_mpt.to_partial_trie();
     let mut txns_mpt = HashedPartialTrie::from(Node::Empty);
     let mut receipts_mpt = HashedPartialTrie::from(Node::Empty);
     let mut gas_used = U256::zero();
     let mut bloom: Bloom = Bloom::zero();
+
     // Withdrawals
     let wds = if let Some(v) = &block.withdrawals {
-        v.into_iter()
+        v.iter()
             .map(|w| (w.address, w.amount * 1_000_000_000)) // Alchemy returns Gweis for some reason
             .collect()
     } else {
         vec![]
     };
-    for (i, (tx, mut touched, signed_txn)) in izip!(txns_info, traces, signed_txns)
+
+    let mut storage_mpts: HashMap<_, _> = storage_mpts
+        .iter()
+        .map(|(a, m)| (*a, m.to_partial_trie()))
+        .collect();
+
+    let mut proof_gen_ir = Vec::new();
+    for (i, (tx, mut touched, signed_txn)) in izip!(txns_info, traces, txn_rlps)
         .enumerate()
         .take(tx_index + 1)
     {
-        log::info!("Processing {}-th transaction: {:?}", i, tx.hash);
+        tracing::info!("Processing {}-th transaction: {:?}", i, tx.hash);
         let last_tx = i == block.transactions.len() - 1;
         let trace = provider
             .debug_trace_transaction(tx.hash, tracing_options_diff())
@@ -344,10 +326,11 @@ async fn prove_tx(
         let (next_state_mpt, next_storage_mpts) = apply_diffs(
             state_mpt.clone(),
             storage_mpts.clone(),
-            &mut contract_code,
+            &mut contract_codes,
             trace,
         );
-        // For the last tx, we want to include the withdrawal addresses in the state trie.
+        // For the last tx, we want to include the withdrawal addresses in the state
+        // trie.
         if last_tx {
             for (addr, _) in &wds {
                 if !touched.contains_key(addr) {
@@ -382,7 +365,8 @@ async fn prove_tx(
 
         // Use withdrawals for the last tx in the block.
         let withdrawals = if last_tx { wds.clone() } else { vec![] };
-        // For the last tx, we check that the final trie roots match those in the block header.
+        // For the last tx, we check that the final trie roots match those in the block
+        // header.
         let trie_roots_after = if last_tx {
             TrieRoots {
                 state_root: block.state_root,
@@ -405,7 +389,7 @@ async fn prove_tx(
                 storage_tries: trimmed_storage_mpts.into_iter().collect(),
             },
             withdrawals,
-            contract_code: contract_code.clone(),
+            contract_code: contract_codes.clone(),
             block_metadata: block_metadata.clone(),
             block_hashes: BlockHashes {
                 prev_hashes: vec![H256::zero(); 256], // TODO
@@ -417,24 +401,7 @@ async fn prove_tx(
             trie_roots_after,
             txn_number_before: receipt.transaction_index.0[0].into(),
         };
-        // if i == tx_index {
-        log::info!("Proving {}-th transaction: {:?}", i, tx.hash);
-        let mut timing = TimingTree::new(&format!("Prove txn {:?}", tx.hash), log::Level::Debug);
-        let _proof = prove::<GoldilocksField, KeccakGoldilocksConfig, 2>(
-            &AllStark::default(),
-            &StarkConfig::standard_fast_config(),
-            inputs,
-            &mut timing
-        )?;
-        timing.filter(Duration::from_millis(100)).print();
-        // let _proof = generate_traces::<GoldilocksField, 2>(
-        //     &AllStark::default(),
-        //     inputs,
-        //     &StarkConfig::standard_fast_config(),
-        //     &mut TimingTree::default(),
-        // )?;
-        log::info!("Successfully proved {}-th transaction: {:?}", i, tx.hash);
-        // }
+
         state_mpt = next_state_mpt;
         storage_mpts = next_storage_mpts;
         gas_used += receipt.gas_used.unwrap();
@@ -442,9 +409,12 @@ async fn prove_tx(
         bloom = new_bloom;
         txns_mpt = new_txns_mpt;
         receipts_mpt = new_receipts_mpt;
+
+        proof_gen_ir.push(TxnProofGenIR {
+            gen_inputs: inputs,
+            txn_idx: i,
+        });
     }
 
-    // dbg!(state_mpt.hash());
-
-    Ok(())
+    Ok(proof_gen_ir)
 }
